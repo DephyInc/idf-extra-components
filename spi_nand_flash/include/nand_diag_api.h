@@ -35,6 +35,18 @@ esp_err_t nand_get_bad_block_stats(spi_nand_flash_device_t *flash, uint32_t *bad
  */
 esp_err_t nand_get_ecc_stats(spi_nand_flash_device_t *flash);
 
+/** @brief Log a combined NAND health summary: bad-block count and ECC error stats.
+ *
+ * Convenience wrapper around nand_get_bad_block_stats() and nand_get_ecc_stats():
+ * logs the bad-block count, then the ECC totals (total / not-corrected / exceeding
+ * threshold). Performs a full-chip scan, so call it on demand when storage is idle.
+ *
+ * @param flash The handle to the SPI nand flash chip.
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if flash is NULL, or the first
+ *         underlying error encountered.
+ */
+esp_err_t nand_log_health(spi_nand_flash_device_t *flash);
+
 #ifdef __cplusplus
 }
 #endif

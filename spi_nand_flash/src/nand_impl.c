@@ -18,6 +18,62 @@
 
 static const char *TAG = "nand_hal";
 
+// ======================================================================
+// Optional tPROG/tRD + ECC characterization. Set NAND_MEAS 1 to enable.
+// When on, the blind pre-wait is skipped for read/program so wait_for_ready()
+// times the real busy period (otherwise the configured delay would clamp the
+// number), accumulates min/avg/max, and periodically logs them plus an ECC
+// correction histogram. Off (0) by default: zero overhead, normal timing.
+// ======================================================================
+#define NAND_MEAS 0
+
+// Op tag is always defined so wait_for_ready's signature is stable; the body is
+// compiled only when NAND_MEAS.
+typedef enum { NAND_MEAS_OTHER = 0, NAND_MEAS_READ, NAND_MEAS_PROG } nand_meas_op_t;
+
+#if NAND_MEAS
+#include "esp_timer.h"
+typedef struct { uint32_t n, min_us, max_us; uint64_t sum_us; } nand_meas_stat_t;
+static nand_meas_stat_t s_meas_read = { .min_us = 0xFFFFFFFFu };
+static nand_meas_stat_t s_meas_prog = { .min_us = 0xFFFFFFFFu };
+static uint32_t s_meas_ecc_hist[NAND_ECC_MAX + 1];
+
+static void nand_meas_record(nand_meas_op_t op, uint32_t us)
+{
+    nand_meas_stat_t *s = (op == NAND_MEAS_READ) ? &s_meas_read
+                          : (op == NAND_MEAS_PROG) ? &s_meas_prog : NULL;
+    if (!s) {
+        return;
+    }
+    s->n++;
+    s->sum_us += us;
+    if (us < s->min_us) {
+        s->min_us = us;
+    }
+    if (us > s->max_us) {
+        s->max_us = us;
+    }
+    // Dump on whichever op is driving the workload: every 128 programs (write-heavy)
+    // or every 1024 reads (read-heavy downloads). Averages guarded against n == 0.
+    if ((op == NAND_MEAS_PROG && (s->n % 128u) == 0) || (op == NAND_MEAS_READ && (s->n % 1024u) == 0)) {
+        ESP_LOGI("nand_meas",
+                 "prog us min/avg/max=%u/%u/%u n=%u | read us min/avg/max=%u/%u/%u n=%u | "
+                 "ecc ok=%u 1-3=%u 4-6=%u 7-8=%u NOTCORR=%u",
+                 (unsigned)(s_meas_prog.n ? s_meas_prog.min_us : 0),
+                 (unsigned)(s_meas_prog.n ? s_meas_prog.sum_us / s_meas_prog.n : 0),
+                 (unsigned)s_meas_prog.max_us, (unsigned)s_meas_prog.n,
+                 (unsigned)(s_meas_read.n ? s_meas_read.min_us : 0),
+                 (unsigned)(s_meas_read.n ? s_meas_read.sum_us / s_meas_read.n : 0),
+                 (unsigned)s_meas_read.max_us, (unsigned)s_meas_read.n,
+                 (unsigned)s_meas_ecc_hist[NAND_ECC_OK],
+                 (unsigned)s_meas_ecc_hist[NAND_ECC_1_TO_3_BITS_CORRECTED],
+                 (unsigned)s_meas_ecc_hist[NAND_ECC_4_TO_6_BITS_CORRECTED],
+                 (unsigned)s_meas_ecc_hist[NAND_ECC_7_8_BITS_CORRECTED],
+                 (unsigned)s_meas_ecc_hist[NAND_ECC_NOT_CORRECTED]);
+    }
+}
+#endif // NAND_MEAS
+
 static esp_err_t detect_chip(spi_nand_flash_device_t *dev)
 {
     uint8_t manufacturer_id = 0;
@@ -161,11 +217,19 @@ static esp_err_t s_verify_write(spi_nand_flash_device_t *handle, const uint8_t *
 }
 #endif //CONFIG_NAND_FLASH_VERIFY_WRITE
 
-static esp_err_t wait_for_ready(spi_nand_flash_device_t *dev, uint32_t expected_operation_time_us, uint8_t *status_out)
+static esp_err_t wait_for_ready(spi_nand_flash_device_t *dev, uint32_t expected_operation_time_us, uint8_t *status_out,
+                                nand_meas_op_t meas_op)
 {
-    if (expected_operation_time_us < ROM_WAIT_THRESHOLD_US) {
-        esp_rom_delay_us(expected_operation_time_us);
-    }
+#if NAND_MEAS
+    const bool measuring = (meas_op != NAND_MEAS_OTHER);
+    const int64_t t0 = measuring ? esp_timer_get_time() : 0;
+    if (measuring) {
+        esp_rom_delay_us(2); // clear tWB so STAT_BUSY is valid on the first poll, then time the real busy period
+    } else
+#endif
+        if (expected_operation_time_us < ROM_WAIT_THRESHOLD_US) {
+            esp_rom_delay_us(expected_operation_time_us);
+        }
 
     while (true) {
         uint8_t status;
@@ -178,11 +242,24 @@ static esp_err_t wait_for_ready(spi_nand_flash_device_t *dev, uint32_t expected_
             break;
         }
 
+#if NAND_MEAS
+        if (!measuring && expected_operation_time_us >= ROM_WAIT_THRESHOLD_US) {
+            vTaskDelay(1);
+        }
+#else
         if (expected_operation_time_us >= ROM_WAIT_THRESHOLD_US) {
             vTaskDelay(1);
         }
+#endif
     }
 
+#if NAND_MEAS
+    if (measuring) {
+        nand_meas_record(meas_op, (uint32_t)(esp_timer_get_time() - t0));
+    }
+#else
+    (void)meas_op;
+#endif
     return ESP_OK;
 }
 
@@ -190,14 +267,14 @@ static esp_err_t read_page_and_wait(spi_nand_flash_device_t *dev, uint32_t page,
 {
     ESP_RETURN_ON_ERROR(spi_nand_read_page(dev, page), TAG, "");
 
-    return wait_for_ready(dev, dev->chip.read_page_delay_us, status_out);
+    return wait_for_ready(dev, dev->chip.read_page_delay_us, status_out, NAND_MEAS_READ);
 }
 
 static esp_err_t program_execute_and_wait(spi_nand_flash_device_t *dev, uint32_t page, uint8_t *status_out)
 {
     ESP_RETURN_ON_ERROR(spi_nand_program_execute(dev, page), TAG, "");
 
-    return wait_for_ready(dev, dev->chip.program_page_delay_us, status_out);
+    return wait_for_ready(dev, dev->chip.program_page_delay_us, status_out, NAND_MEAS_PROG);
 }
 
 static uint16_t get_column_address(spi_nand_flash_device_t *handle, uint32_t block, uint32_t offset)
@@ -257,7 +334,7 @@ esp_err_t nand_mark_bad(spi_nand_flash_device_t *handle, uint32_t block)
     ESP_GOTO_ON_ERROR(spi_nand_write_enable(handle), fail, TAG, "");
     ESP_GOTO_ON_ERROR(spi_nand_erase_block(handle, first_block_page),
                       fail, TAG, "");
-    ESP_GOTO_ON_ERROR(wait_for_ready(handle, handle->chip.erase_block_delay_us, &status),
+    ESP_GOTO_ON_ERROR(wait_for_ready(handle, handle->chip.erase_block_delay_us, &status, NAND_MEAS_OTHER),
                       fail, TAG, "");
     if ((status & STAT_ERASE_FAILED) != 0) {
         ret = ESP_ERR_NOT_FINISHED;
@@ -297,7 +374,7 @@ esp_err_t nand_erase_block(spi_nand_flash_device_t *handle, uint32_t block)
     ESP_GOTO_ON_ERROR(spi_nand_erase_block(handle, first_block_page),
                       fail, TAG, "");
     ESP_GOTO_ON_ERROR(wait_for_ready(handle,
-                                     handle->chip.erase_block_delay_us, &status),
+                                     handle->chip.erase_block_delay_us, &status, NAND_MEAS_OTHER),
                       fail, TAG, "");
 
     if ((status & STAT_ERASE_FAILED) != 0) {
@@ -426,6 +503,11 @@ static bool is_ecc_error(spi_nand_flash_device_t *dev, uint8_t status)
         bits_corrected_status = NAND_ECC_MAX;
     }
     dev->chip.ecc_data.ecc_corrected_bits_status = bits_corrected_status;
+#if NAND_MEAS
+    if (bits_corrected_status <= NAND_ECC_MAX) {
+        s_meas_ecc_hist[bits_corrected_status]++;
+    }
+#endif
     if (bits_corrected_status) {
         if (bits_corrected_status == NAND_ECC_MAX) {
             ESP_LOGE(TAG, "%s: Error while initializing value of ecc_status_reg_len_in_bits", __func__);

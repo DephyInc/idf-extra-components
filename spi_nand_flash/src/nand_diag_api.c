@@ -84,3 +84,26 @@ esp_err_t nand_get_ecc_stats(spi_nand_flash_device_t *flash)
              ecc_err_total_count, ecc_err_not_corrected_count, flash->chip.ecc_data.ecc_data_refresh_threshold, ecc_err_exceeding_threshold_count);
     return ret;
 }
+
+esp_err_t nand_log_health(spi_nand_flash_device_t *flash)
+{
+    if (flash == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t bad_blocks = 0;
+    esp_err_t bb_ret = nand_get_bad_block_stats(flash, &bad_blocks);
+    if (bb_ret == ESP_OK) {
+        ESP_LOGI(TAG, "NAND health: bad block count = %"PRIu32"", bad_blocks);
+    } else {
+        ESP_LOGE(TAG, "NAND health: bad block scan failed (%s)", esp_err_to_name(bb_ret));
+    }
+
+    // nand_get_ecc_stats() logs the ECC summary (total / not-corrected / exceeding-threshold) itself.
+    esp_err_t ecc_ret = nand_get_ecc_stats(flash);
+    if (ecc_ret != ESP_OK) {
+        ESP_LOGE(TAG, "NAND health: ECC scan failed (%s)", esp_err_to_name(ecc_ret));
+    }
+
+    return (bb_ret != ESP_OK) ? bb_ret : ecc_ret;
+}
